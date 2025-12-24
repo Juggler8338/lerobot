@@ -22,9 +22,9 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("diffusion")
+@PreTrainedConfig.register_subclass("dit")
 @dataclass
-class DiffusionConfig(PreTrainedConfig):
+class DitConfig(PreTrainedConfig):
     """Configuration class for DiffusionPolicy.
 
     Defaults are configured for training with PushT providing proprioceptive and single camera observations.
@@ -105,7 +105,7 @@ class DiffusionConfig(PreTrainedConfig):
 
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 16
+    horizon: int = 100
     n_action_steps: int = 8
 
     normalization_mapping: dict[str, NormalizationMode] = field(
@@ -129,11 +129,7 @@ class DiffusionConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    # Unet.
-    down_dims: tuple[int, ...] = (512, 1024, 2048)
-    kernel_size: int = 5
-    n_groups: int = 8
-    diffusion_step_embed_dim: int = 128
+    diffusion_step_embed_dim: int = 512
     use_film_scale_modulation: bool = True
     # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
@@ -144,6 +140,13 @@ class DiffusionConfig(PreTrainedConfig):
     prediction_type: str = "epsilon"
     clip_sample: bool = True
     clip_sample_range: float = 1.0
+
+    # Transformer
+    n_layer: int = 12
+    n_head: int = 8
+    p_drop_attn: float = 0.1
+    causal_attn: bool = True
+    use_time_token: bool = False  # 推荐开启 
 
     # Inference
     num_inference_steps: int | None = None
@@ -178,15 +181,6 @@ class DiffusionConfig(PreTrainedConfig):
             raise ValueError(
                 f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
                 f"Got {self.noise_scheduler_type}."
-            )
-
-        # Check that the horizon size and U-Net downsampling is compatible.
-        # U-Net downsamples by 2 with each stage.
-        downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
-            raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor (which is determined "
-                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
             )
 
     def get_optimizer_preset(self) -> AdamConfig:

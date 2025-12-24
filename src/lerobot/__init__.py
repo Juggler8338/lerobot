@@ -157,7 +157,7 @@ available_datasets = sorted(
 )
 
 # lists all available policies from `lerobot/policies`
-available_policies = ["act", "diffusion", "tdmpc", "vqbet"]
+available_policies = ["act", "diffusion", "tdmpc", "vqbet","diffusion_t"]
 
 # lists all available robots from `lerobot/robots`
 available_robots = [
@@ -183,7 +183,7 @@ available_motors = [
 # keys and values refer to yaml files
 available_policies_per_env = {
     "aloha": ["act"],
-    "pusht": ["diffusion", "vqbet"],
+    "pusht": ["diffusion", "vqbet","diffusion_t"],
     "koch_real": ["act_koch_real"],
     "aloha_real": ["act_aloha_real"],
 }

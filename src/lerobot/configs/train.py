@@ -53,7 +53,7 @@ class TrainPipelineConfig(HubMixin):
     # Number of workers for the dataloader.
     num_workers: int = 4
     batch_size: int = 8
-    steps: int = 100_000
+    steps: int = 200_000
     eval_freq: int = 20_000
     log_freq: int = 200
     tolerance_s: float = 1e-4
