@@ -1,4 +1,3 @@
-# Adapted for Standard Diffusion (DDPM) using the clean DiT architecture.
 
 import copy
 import math
@@ -17,7 +16,7 @@ from lerobot.utils.constants import (
     OBS_IMAGES,
 )
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
-from lerobot.policies.diffusion_t.configuration_dit import DitConfig 
+from lerobot.policies.jit.configuration_jit import JiTConfig 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -41,7 +40,7 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
     return x * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
 
 
-# --- Architecture Classes (Kept from the "Clean" DiT implementation) ---
+# --- Architecture Classes (Kept from the "Clean" JiT implementation) ---
 
 class _TimeNetwork(nn.Module):
     def __init__(self, frequency_embedding_dim, hidden_dim, learnable_w=False, max_period=10000):
@@ -102,7 +101,7 @@ class _ZeroScaleMod(nn.Module):
         nn.init.zeros_(self.scale.bias)
 
 
-class _DiTDecoder(nn.Module):
+class _JiTDecoder(nn.Module):
     def __init__(
         self, d_model=256, nhead=6, dim_feedforward=2048, dropout=0.0, activation="gelu"
     ):
@@ -192,9 +191,9 @@ class _TransformerDecoder(nn.Module):
             layer.reset_parameters()
 
 
-class _DiTNet(nn.Module):
+class _JiTNet(nn.Module):
     """
-    Standard DiT Network.
+    Standard JiT Network.
     Accepts noisy_actions, timestep, and global_cond.
     Predicts Noise (epsilon).
     """
@@ -231,7 +230,7 @@ class _DiTNet(nn.Module):
         self.cond_proj = nn.Linear(cond_dim, hidden_dim)
 
         # Backbone
-        decoder_module = _DiTDecoder(
+        decoder_module = _JiTDecoder(
             hidden_dim,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
@@ -244,7 +243,7 @@ class _DiTNet(nn.Module):
         self.final_layer = _FinalLayer(hidden_dim, ac_dim)
 
         print(
-            "DiT Param Count: {:.2f}M".format(
+            "JiT Param Count: {:.2f}M".format(
                 sum(p.numel() for p in self.parameters()) / 1e6
             )
         )
@@ -351,21 +350,21 @@ class DDPMScheduler(nn.Module):
         return pred_prev_sample
 
 
-class DitPolicy(PreTrainedPolicy):
+class JiTPolicy(PreTrainedPolicy):
     """
-    Standard Diffusion Policy with DiT Architecture.
+    Standard Diffusion Policy with JiT Architecture.
     """
-    config_class = DitConfig
-    name = "DiT"
+    config_class = JiTConfig
+    name = "JiT"
 
-    def __init__(self, config: DitConfig, **kwargs):
+    def __init__(self, config: JiTConfig, **kwargs):
         super().__init__(config)
         config.validate_features()
         self.config = config
         self._queues = None
         
         # Initialize Model
-        self.model = DiTModel(config)
+        self.model = JiTModel(config)
         self.reset()
 
     def get_optim_params(self) -> dict:
@@ -385,7 +384,7 @@ class DitPolicy(PreTrainedPolicy):
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        predict a chunk of actions given given environment observation
+        必须实现的方法：基于当前队列中的观测历史，预测一段动作序列。
         """
         # 将队列中的数据堆叠起来 (B, T, ...)
         batch_data = {
@@ -428,8 +427,8 @@ class DitPolicy(PreTrainedPolicy):
         return loss, None
 
 
-class DiTModel(nn.Module):
-    def __init__(self, config: DitConfig):
+class JiTModel(nn.Module):
+    def __init__(self, config: JiTConfig):
         super().__init__()
         self.config = config
 
@@ -452,7 +451,7 @@ class DiTModel(nn.Module):
         self.global_cond_dim = global_cond_dim
 
         # --- 2. Diffusion Network ---
-        self.net = _DiTNet(
+        self.net = _JiTNet(
             ac_dim=config.action_feature.shape[0],
             ac_chunk=config.horizon,
             cond_dim=self.global_cond_dim * config.n_obs_steps,
