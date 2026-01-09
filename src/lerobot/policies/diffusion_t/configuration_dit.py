@@ -41,7 +41,7 @@ class DitConfig(PreTrainedConfig):
 
     # Diffusion Transformer (DiT) parameters.
     frequency_embedding_dim: int = 256
-    hidden_dim: int = 512
+    hidden_dim: int = 768
     num_blocks: int = 6
     num_heads: int = 16
     dropout: float = 0.1

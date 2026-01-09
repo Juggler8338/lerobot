@@ -12,8 +12,8 @@ from lerobot.configs.types import NormalizationMode
 class JiTConfig(PreTrainedConfig):
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 16
-    n_action_steps: int = 8
+    horizon: int = 32
+    n_action_steps: int = 16
 
     use_proprioceptive: bool = True
 
@@ -41,7 +41,7 @@ class JiTConfig(PreTrainedConfig):
 
     # Diffusion Transformer (DiT) parameters.
     frequency_embedding_dim: int = 256
-    hidden_dim: int = 512
+    hidden_dim: int = 768
     num_blocks: int = 6
     num_heads: int = 16
     dropout: float = 0.1

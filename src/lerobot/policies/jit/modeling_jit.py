@@ -156,20 +156,16 @@ class _FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_size, bias=True)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-        )
+        # 删除原来的 adaLN_modulation（推荐！JiT 和许多现代实现都这么做）
 
     def forward(self, x, t, cond):
-        cond = cond + t
-        shift, scale = self.adaLN_modulation(cond).chunk(2, dim=1)
-        x = modulate(self.norm_final(x), shift, scale)
+        # 删除 cond + t 的调制
+        x = self.norm_final(x)
         x = self.linear(x)
         return x
 
     def reset_parameters(self):
-        for p in self.parameters():
-            nn.init.zeros_(p)
+        nn.init.zeros_(self.linear.bias)  # 可选：bias 零初始化
 
 
 class _TransformerDecoder(nn.Module):
@@ -312,42 +308,37 @@ class DDPMScheduler(nn.Module):
 
     def step(self, model_output, timestep, sample, generator=None):
         """
-        Reverse process: Predict x_{t-1} given x_t and predicted noise (model_output).
-        Using DDPM formulation.
+        Reverse process for x-prediction:
+        model_output = predicted x_0
         """
-        t = timestep
-        # 1. Compute predicted x_0 (optional but good for clipping)
+        t = timestep.item() if torch.is_tensor(timestep) else timestep  # 确保是 int
+        device = sample.device
+        dtype = sample.dtype
+
         beta_t = self.betas[t]
         alpha_t = self.alphas[t]
         alpha_prod_t = self.alphas_cumprod[t]
-        
-        # 2. Compute Mean
-        # coeff1 = 1 / sqrt(alpha_t)
-        # coeff2 = beta_t / sqrt(1 - alpha_prod_t)
-        # pred_prev_sample = coeff1 * (sample - coeff2 * model_output)
-        
-        # Alternative stable formulation (predict x0 then reconstruct):
-        # x_0 = (x_t - sqrt(1-alpha_bar)*eps) / sqrt(alpha_bar)
-        pred_original_sample = (sample - torch.sqrt(1 - alpha_prod_t) * model_output) / torch.sqrt(alpha_prod_t)
-        
+        alpha_prod_t_prev = self.alphas_cumprod[t - 1] if t > 0 else torch.tensor(1.0, device=device, dtype=dtype)
+
+        # model_output is pred_x0
+        pred_x0 = model_output
+
+        # Clip predicted x0 (强烈推荐用于动作)
         if self.clip_sample:
-            pred_original_sample = torch.clamp(pred_original_sample, -self.clip_sample_range, self.clip_sample_range)
+            pred_x0 = torch.clamp(pred_x0, -self.clip_sample_range, self.clip_sample_range)
 
-        # Re-compute mean using posterior formula
-        # mean = (sqrt(alpha_bar_prev) * beta / (1-alpha_bar)) * x0 + (sqrt(alpha) * (1-alpha_bar_prev) / (1-alpha_bar)) * xt
-        # Simplified for DDPM:
-        pred_prev_sample = (1 / torch.sqrt(alpha_t)) * (sample - (beta_t / torch.sqrt(1 - alpha_prod_t)) * model_output)
+        # Compute posterior mean
+        coeff_x0 = torch.sqrt(alpha_prod_t_prev) * beta_t / (1 - alpha_prod_t)
+        coeff_xt = torch.sqrt(alpha_t) * (1 - alpha_prod_t_prev) / (1 - alpha_prod_t)
+        mean = coeff_x0 * pred_x0 + coeff_xt * sample
 
-        # 3. Add Variance (if t > 0)
-        variance = 0
+        # Add variance if not final step
+        variance = 0.0
         if t > 0:
-            noise = torch.randn(model_output.shape, generator=generator, device=model_output.device, dtype=model_output.dtype)
-            # variance = beta_t (standard) or beta_tilde (posterior)
-            # using fixed large variance (beta_t)
+            noise = torch.randn_like(model_output) if generator is None else torch.randn(model_output.shape, generator=generator, device=device, dtype=dtype)
             variance = torch.sqrt(beta_t) * noise
-        
-        pred_prev_sample = pred_prev_sample + variance
-        return pred_prev_sample
+
+        return mean + variance
 
 
 class JiTPolicy(PreTrainedPolicy):
@@ -499,32 +490,32 @@ class JiTModel(nn.Module):
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        Standard DDPM Loss: MSE(epsilon_pred, epsilon_target)
+        改为 x-prediction: 直接回归干净动作序列 x_0
         """
         # 1. Validation and Encoding
         n_obs_steps = batch["observation.state"].shape[1]
-        trajectory = batch["action"] # (B, T, D)
+        trajectory = batch["action"]  # (B, T, D) 干净动作
         batch_size = trajectory.shape[0]
         global_cond = self._prepare_global_conditioning(batch)
 
-        # 2. Sample Noise
+        # 2. Sample Noise (保持不变)
         noise = torch.randn_like(trajectory)
         
-        # 3. Sample Timesteps (Uniform discrete)
+        # 3. Sample Timesteps
         timesteps = torch.randint(
             0, self.scheduler.num_train_timesteps, (batch_size,), device=trajectory.device
         ).long()
 
-        # 4. Add Noise (Forward Process)
+        # 4. Add Noise → noisy_trajectory (x_t)
         noisy_trajectory = self.scheduler.add_noise(trajectory, noise, timesteps)
 
-        # 5. Predict Noise
-        noise_pred = self.net(noisy_trajectory, timesteps, global_cond)
+        # 5. 模型直接预测 x_0（干净动作）
+        pred_x0 = self.net(noisy_trajectory, timesteps, global_cond)   # ← 这里输出就是 pred_x0
 
-        # 6. MSE Loss
-        loss = F.mse_loss(noise_pred, noise, reduction="none")
+        # 6. MSE Loss: pred_x0 vs 真实干净动作
+        loss = F.mse_loss(pred_x0, trajectory, reduction="none")
 
-        # 7. Masking (for padding)
+        # 7. Masking (保持不变)
         if self.config.do_mask_loss_for_padding:
             if "action_is_pad" not in batch:
                 raise ValueError("action_is_pad is required.")
@@ -535,33 +526,28 @@ class JiTModel(nn.Module):
 
     @torch.no_grad()
     def generate_actions(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        DDPM Sampling Loop
-        """
         batch_size = batch["observation.state"].shape[0]
         device = batch["observation.state"].device
         
-        # 1. Encode
         global_cond = self._prepare_global_conditioning(batch)
 
-        # 2. Start from pure noise
+        # 从纯噪声开始（x_T ≈ N(0,1)）
         current_sample = torch.randn(
             batch_size, self.config.horizon, self.config.action_feature.shape[0],
             device=device
         )
 
-        # 3. Denoising Loop (T -> 0)
+        # 逆向去噪循环（T → 0）
         for t in reversed(range(self.scheduler.num_train_timesteps)):
-            # Create batch of timesteps
             ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
             
-            # Predict noise
+            # 模型输出直接作为 pred_x0
             model_output = self.net(current_sample, ts, global_cond)
             
-            # Step inverse dynamics
+            # 使用新的 x-prediction step
             current_sample = self.scheduler.step(model_output, t, current_sample)
 
-        # 4. Extract action chunk
+        # 提取需要的动作段
         start = self.config.n_obs_steps - 1
         end = start + self.config.n_action_steps
         return current_sample[:, start:end]
