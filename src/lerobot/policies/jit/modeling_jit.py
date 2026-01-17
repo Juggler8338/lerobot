@@ -1,13 +1,11 @@
-
 import copy
-import math
 from collections import deque
 
 import einops
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 
 from lerobot.utils.constants import (
     OBS_ENV_STATE,
@@ -16,7 +14,7 @@ from lerobot.utils.constants import (
     OBS_IMAGES,
 )
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
-from lerobot.policies.jit.configuration_jit import JiTConfig 
+from lerobot.policies.jit.configuration_jit import JiTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -40,11 +38,10 @@ def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor) -> torch
     return x * (1 + scale.unsqueeze(0)) + shift.unsqueeze(0)
 
 
-# --- Architecture Classes (Kept from the "Clean" JiT implementation) ---
-
 class _TimeNetwork(nn.Module):
-    def __init__(self, frequency_embedding_dim, hidden_dim, learnable_w=False, max_period=10000):
-        # NOTE: Standard diffusion uses max_period=10000 typically
+    def __init__(
+        self, frequency_embedding_dim, hidden_dim, learnable_w=False, max_period=1000
+    ):
         assert frequency_embedding_dim % 2 == 0, "time_dim must be even!"
         half_dim = int(frequency_embedding_dim // 2)
         super().__init__()
@@ -60,95 +57,52 @@ class _TimeNetwork(nn.Module):
         )
 
     def forward(self, t):
-        # t: [B] or [B, 1]
-        if t.dim() == 1:
-            t = t.unsqueeze(-1)
-        t = t.float() * self.w[None]
+        assert len(t.shape) == 1, "assumes 1d input timestep array"
+        t = t[:, None] * self.w[None]
         t = torch.cat((torch.cos(t), torch.sin(t)), dim=1)
         return self.out_net(t)
 
-
-class _ShiftScaleMod(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.act = nn.SiLU()
-        self.scale = nn.Linear(dim, dim)
-        self.shift = nn.Linear(dim, dim)
-
-    def forward(self, x, c):
-        c = self.act(c)
-        return x * (1 + self.scale(c)[None]) + self.shift(c)[None]
-
-    def reset_parameters(self):
-        nn.init.zeros_(self.scale.weight)
-        nn.init.zeros_(self.shift.weight)
-        nn.init.zeros_(self.scale.bias)
-        nn.init.zeros_(self.shift.bias)
-
-
-class _ZeroScaleMod(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.act = nn.SiLU()
-        self.scale = nn.Linear(dim, dim)
-
-    def forward(self, x, c):
-        c = self.act(c)
-        return x * self.scale(c)[None]
-
-    def reset_parameters(self):
-        nn.init.zeros_(self.scale.weight)
-        nn.init.zeros_(self.scale.bias)
-
-
-class _JiTDecoder(nn.Module):
+class _DiTDecoder(nn.Module):
     def __init__(
         self, d_model=256, nhead=6, dim_feedforward=2048, dropout=0.0, activation="gelu"
     ):
         super().__init__()
         self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+        
+        # Feedforward
         self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
-        self.norm1 = nn.LayerNorm(d_model, eps=1e-6)
-        self.norm2 = nn.LayerNorm(d_model, eps=1e-6)
+
+        # Standard Norms
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
-        self.dropout3 = nn.Dropout(dropout)
+
         self.activation = _get_activation_fn(activation)
 
-        self.mlp = nn.Sequential(
-            self.linear1,
-            self.activation,
-            self.dropout2,
-            self.linear2,
-            self.dropout3,
-        )
-
-        # AdaLN Modulation
-        self.attn_modulate = _ShiftScaleMod(d_model)
-        self.attn_gate = _ZeroScaleMod(d_model)
-        self.mlp_modulate = _ShiftScaleMod(d_model)
-        self.mlp_gate = _ZeroScaleMod(d_model)
-
-    def forward(self, x, t, cond, need_weights=False):
-        # cond + t injection
-        cond = cond + t
-
-        x2 = self.attn_modulate(self.norm1(x), cond)
+    # 移除 t, cond 参数
+    def forward(self, x, need_weights=False):
+        # x shape: [T, B, D]
+        
+        # Standard Pre-Norm Attention
+        x2 = self.norm1(x)
         x2, _ = self.self_attn(x2, x2, x2, need_weights=need_weights)
-        x = x + self.attn_gate(self.dropout1(x2), cond)
+        x = x + self.dropout1(x2)
 
-        x3 = self.mlp_modulate(self.norm2(x), cond)
-        x3 = self.mlp(x3)
-        x3 = self.mlp_gate(x3, cond)
-        return x + x3
+        # Standard Pre-Norm MLP
+        x2 = self.norm2(x)
+        x2 = self.linear2(self.dropout(self.activation(self.linear1(x2))))
+        x = x + self.dropout2(x2)
+        
+        return x
 
     def reset_parameters(self):
         for p in self.parameters():
             if p.dim() > 1:
                 nn.init.xavier_uniform_(p)
-        for s in (self.attn_modulate, self.attn_gate, self.mlp_modulate, self.mlp_gate):
-            s.reset_parameters()
 
 
 class _FinalLayer(nn.Module):
@@ -156,16 +110,22 @@ class _FinalLayer(nn.Module):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, out_size, bias=True)
-        # 删除原来的 adaLN_modulation（推荐！JiT 和许多现代实现都这么做）
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(), nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
 
     def forward(self, x, t, cond):
-        # 删除 cond + t 的调制
-        x = self.norm_final(x)
+        # process the conditioning vector first
+        cond = cond + t
+
+        shift, scale = self.adaLN_modulation(cond).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
     def reset_parameters(self):
-        nn.init.zeros_(self.linear.bias)  # 可选：bias 零初始化
+        for p in self.parameters():
+            nn.init.zeros_(p)
 
 
 class _TransformerDecoder(nn.Module):
@@ -176,10 +136,11 @@ class _TransformerDecoder(nn.Module):
         )
         self.reset_parameters()
 
-    def forward(self, src, t, cond, **kwargs):
+    # 移除 t, cond 参数
+    def forward(self, src, **kwargs):
         x = src
         for layer in self.layers:
-            x = layer(x, t, cond, **kwargs)
+            x = layer(x, **kwargs)
         return x
 
     def reset_parameters(self):
@@ -187,12 +148,7 @@ class _TransformerDecoder(nn.Module):
             layer.reset_parameters()
 
 
-class _JiTNet(nn.Module):
-    """
-    Standard JiT Network.
-    Accepts noisy_actions, timestep, and global_cond.
-    Predicts Noise (epsilon).
-    """
+class _DiTNoiseNet(nn.Module):
     def __init__(
         self,
         ac_dim,
@@ -205,18 +161,36 @@ class _JiTNet(nn.Module):
         dim_feedforward=2048,
         nhead=8,
         activation="gelu",
+        clip_sample=False,
+        clip_sample_range=1.0,
     ):
+        """DiT Noise Prediction Network.
+
+        Args:
+            ac_dim: Action dimension.
+            ac_chunk: Number of action steps to predict in one forward pass.
+            cond_dim: Dimension of the global conditioning vector.
+            time_dim: Dimension of the time embedding.
+            hidden_dim: Hidden dimension of the transformer.
+            num_blocks: Number of transformer blocks.
+            dropout: Dropout rate.
+            dim_feedforward: Dimension of the feedforward layer in the transformer.
+            nhead: Number of attention heads in the transformer.
+            activation: Activation function to use in the transformer.
+            clip_sample: Whether to clip the output samples.
+            clip_sample_range: Range to clip the output samples if `clip_sample` is True.
+        """
         super().__init__()
         self.ac_dim, self.ac_chunk = ac_dim, ac_chunk
 
-        # Positional embedding for the action sequence
+        # positional encoding blocks
         self.register_parameter(
             "dec_pos",
             nn.Parameter(torch.empty(ac_chunk, 1, hidden_dim), requires_grad=True),
         )
         nn.init.xavier_uniform_(self.dec_pos.data)
 
-        # Time and Input embeddings
+        # input encoder mlps
         self.time_net = _TimeNetwork(time_dim, hidden_dim)
         self.ac_proj = nn.Sequential(
             nn.Linear(ac_dim, ac_dim),
@@ -225,8 +199,8 @@ class _JiTNet(nn.Module):
         )
         self.cond_proj = nn.Linear(cond_dim, hidden_dim)
 
-        # Backbone
-        decoder_module = _JiTDecoder(
+        # decoder blocks
+        decoder_module = _DiTDecoder(
             hidden_dim,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
@@ -235,134 +209,130 @@ class _JiTNet(nn.Module):
         )
         self.decoder = _TransformerDecoder(decoder_module, num_blocks)
 
-        # Output Head
-        self.final_layer = _FinalLayer(hidden_dim, ac_dim)
+        # turns predicted tokens into epsilons
+        self.eps_out = _FinalLayer(hidden_dim, ac_dim)
+
+        # clip the output samples
+        self.clip_sample = clip_sample
+        self.clip_sample_range = clip_sample_range
 
         print(
-            "JiT Param Count: {:.2f}M".format(
+            "Number of flow params: {:.2f}M".format(
                 sum(p.numel() for p in self.parameters()) / 1e6
             )
         )
 
-    def forward(self, noisy_actions, time, global_cond):
-        """
-        noisy_actions: (B, T, action_dim)
-        time: (B,) tensor of integers or floats
-        global_cond: (B, cond_dim)
-        """
-        c = self.cond_proj(global_cond)
-        time_enc = self.time_net(time)
+    def forward(self, noisy_actions, time, global_cond, need_weights=False):
+        # 1. encode conditioning
+        c = self.cond_proj(global_cond)   # [B, hidden_dim]
+        time_enc = self.time_net(time)    # [B, hidden_dim]
 
-        ac_tokens = self.ac_proj(noisy_actions)  # [B, T, hidden]
-        ac_tokens = ac_tokens.transpose(0, 1)    # [T, B, hidden]
+        # 2. encode actions
+        ac_tokens = self.ac_proj(noisy_actions)  # [B, T, hidden_dim]
+        ac_tokens = ac_tokens.transpose(0, 1)    # [T, B, hidden_dim]
 
-        # Add positional embedding
-        dec_in = ac_tokens + self.dec_pos[: ac_tokens.size(0)]
+        # 3. add positional encoding
+        ac_tokens = ac_tokens + self.dec_pos[: ac_tokens.size(0)]
 
-        # Run Transformer
-        dec_out = self.decoder(dec_in, time_enc, c)
+        # 4. 构建 In-Context 序列: [Time_Token, Cond_Token, Action_Tokens...]
+        # unsqueeze(0) 是为了增加序列维度 -> [1, B, hidden_dim]
+        context_tokens = torch.stack([time_enc, c], dim=0) # [2, B, hidden_dim]
+        
+        # concatenate along the sequence dimension
+        dec_in = torch.cat([context_tokens, ac_tokens], dim=0) # [2 + T, B, hidden_dim]
 
-        # Final prediction
-        output = self.final_layer(dec_out, time_enc, c) # [T, B, dim]
-        return output.transpose(0, 1)  # [B, T, dim]
+        # 5. 通过 Transformer (不需要传入 t 和 c 了)
+        dec_out = self.decoder(dec_in, need_weights=need_weights)
 
+        # 6. Slicing
+        # shape: [2 + T, B, hidden_dim]
+        # context tokens are indices 0 and 1. Actions start at 2.
+        ac_out = dec_out[2:] # [T, B, hidden_dim]
 
-# --- Scheduler (Self-Contained DDPM) ---
+        # 7. Final Layer Modulation
+        # save time_enc and c for final layer modulation
+        # time_enc: [B, hidden_dim], c: [B, hidden_dim]
+        # this helps map the general Transformer features back to the physical actions under the current conditioning
+        eps_out = self.eps_out(
+            ac_out, time_enc, c
+        )  # [T, B, hidden_dim] -> [T, B, adim]
+        # 新增：计算 predicted_x (x_1 prediction)
+        noisy_actions_trans = noisy_actions.transpose(0, 1)  # [T, B, ac_dim]
+        pred_x = noisy_actions_trans + eps_out  # 残差形式：v = pred_x - x_t，等价于原 velocity
+        
+        return pred_x.transpose(0, 1)  # [B, T, ac_dim]
+        # return eps_out.transpose(0, 1)  # [B, T, ac_dim]
 
-class DDPMScheduler(nn.Module):
-    """
-    A lightweight DDPM Scheduler to avoid heavy dependencies (like diffusers).
-    """
-    def __init__(self, num_train_timesteps=100, beta_start=0.0001, beta_end=0.02, clip_sample=True, clip_sample_range=1.0):
-        super().__init__()
-        self.num_train_timesteps = num_train_timesteps
-        self.clip_sample = clip_sample
-        self.clip_sample_range = clip_sample_range
+    @torch.no_grad()
+    def sample(
+        self,
+        condition: torch.Tensor,
+        timesteps: int = 100,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        # Use Euler integration to solve the ODE.
+        batch_size, device = condition.shape[0], condition.device
+        z = self.sample_noise(batch_size, device, generator)
+        dt = 1.0 / timesteps
+        t_all = (
+            torch.arange(timesteps, device=device)
+            .float()
+            .unsqueeze(0)
+            .expand(batch_size, timesteps)
+            / timesteps
+        )
+        for k in range(timesteps):
+            t = t_all[:, k]  # (B,)
+            t_exp = t[:, None, None]  # (B, 1, 1) for broadcasting
+            x_pred = self.forward(z, t, condition)  # predict clean x
+            one_minus_t = (1 - t_exp).clamp_min(1e-5)
+            v_pred = (x_pred - z) / one_minus_t  # avoid division by zero
+            z = z + dt * v_pred
+            if self.clip_sample:
+                z = torch.clamp(z, -self.clip_sample_range, self.clip_sample_range)
+        return z
 
-        # Beta Schedule (Linear)
-        betas = torch.linspace(beta_start, beta_end, num_train_timesteps, dtype=torch.float32)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-
-        # Helper function to register buffer (automatically moves to device)
-        self.register_buffer("betas", betas)
-        self.register_buffer("alphas", alphas)
-        self.register_buffer("alphas_cumprod", alphas_cumprod)
-        self.register_buffer("sqrt_alphas_cumprod", torch.sqrt(alphas_cumprod))
-        self.register_buffer("sqrt_one_minus_alphas_cumprod", torch.sqrt(1.0 - alphas_cumprod))
-
-    def add_noise(self, original_samples, noise, timesteps):
-        """
-        Forward process: x_t = sqrt(alpha_bar) * x_0 + sqrt(1-alpha_bar) * epsilon
-        """
-        # Make sure shapes match for broadcasting: (B, 1, 1)
-        sqrt_alpha_prod = self.sqrt_alphas_cumprod[timesteps].flatten()
-        sqrt_one_minus_alpha_prod = self.sqrt_one_minus_alphas_cumprod[timesteps].flatten()
-
-        while len(sqrt_alpha_prod.shape) < len(original_samples.shape):
-            sqrt_alpha_prod = sqrt_alpha_prod.unsqueeze(-1)
-            sqrt_one_minus_alpha_prod = sqrt_one_minus_alpha_prod.unsqueeze(-1)
-
-        noisy_samples = sqrt_alpha_prod * original_samples + sqrt_one_minus_alpha_prod * noise
-        return noisy_samples
-
-    def step(self, model_output, timestep, sample, generator=None):
-        """
-        Reverse process for x-prediction:
-        model_output = predicted x_0
-        """
-        t = timestep.item() if torch.is_tensor(timestep) else timestep  # 确保是 int
-        device = sample.device
-        dtype = sample.dtype
-
-        beta_t = self.betas[t]
-        alpha_t = self.alphas[t]
-        alpha_prod_t = self.alphas_cumprod[t]
-        alpha_prod_t_prev = self.alphas_cumprod[t - 1] if t > 0 else torch.tensor(1.0, device=device, dtype=dtype)
-
-        # model_output is pred_x0
-        pred_x0 = model_output
-
-        # Clip predicted x0 (强烈推荐用于动作)
-        if self.clip_sample:
-            pred_x0 = torch.clamp(pred_x0, -self.clip_sample_range, self.clip_sample_range)
-
-        # Compute posterior mean
-        coeff_x0 = torch.sqrt(alpha_prod_t_prev) * beta_t / (1 - alpha_prod_t)
-        coeff_xt = torch.sqrt(alpha_t) * (1 - alpha_prod_t_prev) / (1 - alpha_prod_t)
-        mean = coeff_x0 * pred_x0 + coeff_xt * sample
-
-        # Add variance if not final step
-        variance = 0.0
-        if t > 0:
-            noise = torch.randn_like(model_output) if generator is None else torch.randn(model_output.shape, generator=generator, device=device, dtype=dtype)
-            variance = torch.sqrt(beta_t) * noise
-
-        return mean + variance
+    def sample_noise(
+        self, batch_size: int, device, generator: torch.Generator | None = None
+    ) -> torch.Tensor:
+        return torch.randn(
+            batch_size, self.ac_chunk, self.ac_dim, device=device, generator=generator
+        )
 
 
 class JiTPolicy(PreTrainedPolicy):
-    """
-    Standard Diffusion Policy with JiT Architecture.
-    """
     config_class = JiTConfig
-    name = "JiT"
+    name = "Jit"
 
-    def __init__(self, config: JiTConfig, **kwargs):
+    def __init__(
+        self,
+        config: JiTConfig,
+        **kwargs
+        # dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
+    ):
+        """
+        Args:
+            config: Policy configuration class instance or None, in which case the default instantiation of
+                the configuration class is used.
+            dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
+                that they will be passed with a call to `load_state_dict` before the policy is used.
+        """
         super().__init__(config)
         config.validate_features()
         self.config = config
+
+        # queues are populated during rollout of the policy, they contain the n latest observations and actions
         self._queues = None
-        
-        # Initialize Model
-        self.model = JiTModel(config)
+
+        self.jit = DiTModel(config)
+
         self.reset()
 
     def get_optim_params(self) -> dict:
-        return self.model.parameters()
+        return self.jit.parameters()
 
     def reset(self):
-        """Clear observation and action queues."""
+        """Clear observation and action queues. Should be called on `env.reset()`"""
         self._queues = {
             "observation.state": deque(maxlen=self.config.n_obs_steps),
             "action": deque(maxlen=self.config.n_action_steps),
@@ -370,63 +340,91 @@ class JiTPolicy(PreTrainedPolicy):
         if self.config.image_features:
             self._queues[OBS_IMAGES] = deque(maxlen=self.config.n_obs_steps)
         if self.config.env_state_feature:
-            self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
+            self._queues["observation.environment_state"] = deque(
+                maxlen=self.config.n_obs_steps
+            )
 
     @torch.no_grad()
     def predict_action_chunk(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        """
-        必须实现的方法：基于当前队列中的观测历史，预测一段动作序列。
-        """
-        # 将队列中的数据堆叠起来 (B, T, ...)
-        batch_data = {
-            k: torch.stack(list(self._queues[k]), dim=1) 
-            for k in batch 
+        """Predict a chunk of actions given environment observations."""
+        # stack n latest observations from the queue
+        batch = {
+            k: torch.stack(list(self._queues[k]), dim=1)
+            for k in batch
             if k in self._queues
         }
-        # 调用模型生成动作
-        return self.model.generate_actions(batch_data)
+        actions = self.jit.generate_actions(batch)
+
+        return actions
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """Select a single action given environment observations.
+
+        This method handles caching a history of observations and an action trajectory generated by the
+        underlying flow model. Here's how it works:
+          - `n_obs_steps` steps worth of observations are cached (for the first steps, the observation is
+            copied `n_obs_steps` times to fill the cache).
+          - The flow model generates `horizon` steps worth of actions.
+          - `n_action_steps` worth of actions are actually kept for execution, starting from the current step.
+        Schematically this looks like:
+            ----------------------------------------------------------------------------------------------
+            (legend: o = n_obs_steps, h = horizon, a = n_action_steps)
+            |timestep            | n-o+1 | n-o+2 | ..... | n     | ..... | n+a-1 | n+a   | ..... | n-o+h |
+            |observation is used | YES   | YES   | YES   | YES   | NO    | NO    | NO    | NO    | NO    |
+            |action is generated | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   | YES   |
+            |action is used      | NO    | NO    | NO    | YES   | YES   | YES   | NO    | NO    | NO    |
+            ----------------------------------------------------------------------------------------------
+        Note that this means we require: `n_action_steps <= horizon - n_obs_steps + 1`. Also, note that
+        "horizon" may not the best name to describe what the variable actually means, because this period is
+        actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
-        执行单个动作。如果动作队列为空，则调用 predict_action_chunk 补充新动作。
-        """
-        if ACTION in batch: 
+        # NOTE: for offline evaluation, we have action in the batch, so we need to pop it out
+        if ACTION in batch:
             batch.pop(ACTION)
-        
-        # 处理图像特征堆叠
+
         if self.config.image_features:
-            batch = dict(batch)
-            batch[OBS_IMAGES] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        
-        # 更新观测队列
+            batch = dict(
+                batch
+            )  # shallow copy so that adding a key doesn't modify the original
+            batch[OBS_IMAGES] = torch.stack(
+                [batch[key] for key in self.config.image_features], dim=-4
+            )
+        # NOTE: It's important that this happens after stacking the images into a single key.
         self._queues = populate_queues(self._queues, batch)
 
-        # 如果动作队列用完了，预测新的一块
         if len(self._queues[ACTION]) == 0:
             actions = self.predict_action_chunk(batch)
-            # 转置并存入队列: (B, T, D) -> (T, B, D) 以便逐个弹出
             self._queues[ACTION].extend(actions.transpose(0, 1))
 
-        return self._queues[ACTION].popleft()
+        action = self._queues[ACTION].popleft()
+        return action
 
     def forward(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Run the batch through the model and compute the loss for training or validation."""
         if self.config.image_features:
-            batch = dict(batch)
-            batch["observation.images"] = torch.stack([batch[key] for key in self.config.image_features], dim=-4)
-        loss = self.model.compute_loss(batch)
+            batch = dict(
+                batch
+            )  # shallow copy so that adding a key doesn't modify the original
+            batch["observation.images"] = torch.stack(
+                [batch[key] for key in self.config.image_features], dim=-4
+            )
+        loss = self.jit.compute_loss(batch)
         return loss, None
 
 
-class JiTModel(nn.Module):
+class DiTModel(nn.Module):
     def __init__(self, config: JiTConfig):
         super().__init__()
         self.config = config
 
-        # --- 1. Encoder Setup (Same as before) ---
+        # Build observation encoders (depending on which observations are provided).
         global_cond_dim = (
-            self.config.robot_state_feature.shape[0] if self.config.use_proprioceptive else 0
+            self.config.robot_state_feature.shape[0]
+            if self.config.use_proprioceptive
+            else 0
         )
+
         if self.config.image_features:
             num_images = len(self.config.image_features)
             if self.config.use_separate_rgb_encoder_per_camera:
@@ -438,11 +436,9 @@ class JiTModel(nn.Module):
                 global_cond_dim += self.rgb_encoder.feature_dim * num_images
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
-        
-        self.global_cond_dim = global_cond_dim
 
-        # --- 2. Diffusion Network ---
-        self.net = _JiTNet(
+        self.global_cond_dim = global_cond_dim
+        self.velocity_net = _DiTNoiseNet(
             ac_dim=config.action_feature.shape[0],
             ac_chunk=config.horizon,
             cond_dim=self.global_cond_dim * config.n_obs_steps,
@@ -453,101 +449,195 @@ class JiTModel(nn.Module):
             dim_feedforward=config.dim_feedforward,
             nhead=config.num_heads,
             activation=config.activation,
-        )
-
-        # --- 3. Noise Scheduler (Standard DDPM) ---
-        # NOTE: Using num_inference_steps as train steps for simplicity in config mapping, 
-        # or use a default 100 for training. 
-        self.scheduler = DDPMScheduler(
-            num_train_timesteps=config.num_inference_steps or 100,
-            beta_start=1e-4, 
-            beta_end=0.02,
             clip_sample=config.clip_sample,
             clip_sample_range=config.clip_sample_range,
         )
 
-    def _prepare_global_conditioning(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        # Same encoding logic
+        self.num_inference_steps = config.num_inference_steps or 100
+        self.training_noise_sampling = config.training_noise_sampling
+        if config.training_noise_sampling == "uniform":
+            self.noise_distribution = torch.distributions.Uniform(
+                low=0,
+                high=1,
+            )
+        elif config.training_noise_sampling == "beta":
+            # From the Pi0 paper, https://www.physicalintelligence.company/download/pi0.pdf Appendix B.
+            # There, they say the PDF for the distribution they use is the following:
+            # $p(t) = Beta((s-t) / s; 1.5, 1)$
+            # So, we first figure out the distribution over $t'$ and then transform it to $t = s - s * t'$.
+            s = 0.999  # constant from the paper
+            beta_dist = torch.distributions.Beta(
+                concentration1=1.5,  # alpha
+                concentration0=1.0,  # beta
+            )
+            affine_transform = torch.distributions.transforms.AffineTransform(
+                loc=s, scale=-s
+            )
+            self.noise_distribution = torch.distributions.TransformedDistribution(
+                beta_dist, [affine_transform]
+            )
+        else:
+            raise ValueError(f"Unknown {config.training_noise_sampling=}")
+
+    # ========= inference  ============
+    def conditional_sample(
+        self,
+        batch_size: int,
+        global_cond: torch.Tensor | None = None,
+        generator: torch.Generator | None = None,
+    ) -> torch.Tensor:
+        device = get_device_from_parameters(self)
+        dtype = get_dtype_from_parameters(self)
+
+        # Expand global conditioning to the batch size.
+        if global_cond is not None:
+            global_cond = global_cond.expand(batch_size, -1).to(
+                device=device, dtype=dtype
+            )
+
+        # Sample prior.
+        sample = self.velocity_net.sample(
+            global_cond, timesteps=self.num_inference_steps, generator=generator
+        )
+        return sample
+
+    def _prepare_global_conditioning(
+        self, batch: dict[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = batch[OBS_STATE].shape[:2]
         global_cond_feats = [batch[OBS_STATE]]
-        
+        # Extract image features.
         if self.config.image_features:
             if self.config.use_separate_rgb_encoder_per_camera:
-                images_per_camera = einops.rearrange(batch[OBS_IMAGES], "b s n ... -> n (b s) ...")
-                img_features_list = torch.cat(
-                    [encoder(images) for encoder, images in zip(self.rgb_encoder, images_per_camera)]
+                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
+                images_per_camera = einops.rearrange(
+                    batch[OBS_IMAGES], "b s n ... -> n (b s) ..."
                 )
-                img_features = einops.rearrange(img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps)
+                img_features_list = torch.cat(
+                    [
+                        encoder(images)
+                        for encoder, images in zip(
+                            self.rgb_encoder, images_per_camera, strict=True
+                        )
+                    ]
+                )
+                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features_list,
+                    "(n b s) ... -> b s (n ...)",
+                    b=batch_size,
+                    s=n_obs_steps,
+                )
             else:
-                img_features = self.rgb_encoder(einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ..."))
-                img_features = einops.rearrange(img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps)
+                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
+                img_features = self.rgb_encoder(
+                    einops.rearrange(batch[OBS_IMAGES], "b s n ... -> (b s n) ...")
+                )
+                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features,
+                    "(b s n) ... -> b s (n ...)",
+                    b=batch_size,
+                    s=n_obs_steps,
+                )
             global_cond_feats.append(img_features)
 
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
+        # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+
+    def generate_actions(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+        """
+        This function expects `batch` to have:
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+        }
+        """
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
+
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
+
+        # run sampling
+        actions = self.conditional_sample(batch_size, global_cond=global_cond)
+
+        # Extract `n_action_steps` steps worth of actions (from the current observation).
+        start = n_obs_steps - 1
+        end = start + self.config.n_action_steps
+        actions = actions[:, start:end]
+
+        return actions
 
     def compute_loss(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
         """
-        改为 x-prediction: 直接回归干净动作序列 x_0
+        This function expects `batch` to have (at least):
+        {
+            "observation.state": (B, n_obs_steps, state_dim)
+
+            "observation.images": (B, n_obs_steps, num_cameras, C, H, W)
+                AND/OR
+            "observation.environment_state": (B, environment_dim)
+
+            "action": (B, horizon, action_dim)
+            "action_is_pad": (B, horizon)
+        }
         """
-        # 1. Validation and Encoding
+        # Input validation.
+        assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
         n_obs_steps = batch["observation.state"].shape[1]
-        trajectory = batch["action"]  # (B, T, D) 干净动作
-        batch_size = trajectory.shape[0]
-        global_cond = self._prepare_global_conditioning(batch)
+        horizon = batch["action"].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
 
-        # 2. Sample Noise (保持不变)
-        noise = torch.randn_like(trajectory)
-        
-        # 3. Sample Timesteps
-        timesteps = torch.randint(
-            0, self.scheduler.num_train_timesteps, (batch_size,), device=trajectory.device
-        ).long()
+        # Encode image features and concatenate them all together along with the state vector.
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
-        # 4. Add Noise → noisy_trajectory (x_t)
-        noisy_trajectory = self.scheduler.add_noise(trajectory, noise, timesteps)
+        # Forward diffusion.
+        trajectory = batch["action"]
+        # Sample noise to add to the trajectory.
+        noise = self.velocity_net.sample_noise(trajectory.shape[0], trajectory.device)
+        # Sample a random noising timestep for each item in the batch.
+        timesteps = self.noise_distribution.sample((trajectory.shape[0],)).to(
+            trajectory.device
+        )
+        t=timesteps[:, None, None]
+        # Add noise to the clean trajectories according to the noise magnitude at each timestep.
+        z = (1 - t) * noise + t * trajectory
 
-        # 5. 模型直接预测 x_0（干净动作）
-        pred_x0 = self.net(noisy_trajectory, timesteps, global_cond)   # ← 这里输出就是 pred_x0
+        # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
+        x_pred = self.velocity_net(
+            noisy_actions=z, time=timesteps, global_cond=global_cond
+        )
 
-        # 6. MSE Loss: pred_x0 vs 真实干净动作
-        loss = F.mse_loss(pred_x0, trajectory, reduction="none")
+        # v_pred = (x_pred - z) / (1 - t)
+        one_minus_t = (1 - t).clamp_min(1e-5)
+        v_pred = (x_pred - z) / one_minus_t  # avoid div by zero
 
-        # 7. Masking (保持不变)
+        # target velocity v = x - e
+        target_v = trajectory - noise
+        # target_v = (trajectory - z) / one_minus_t
+
+        # L2 loss matching the provided pattern
+        loss = (target_v - v_pred) ** 2
+        # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
             if "action_is_pad" not in batch:
-                raise ValueError("action_is_pad is required.")
+                raise ValueError(
+                    "You need to provide 'action_is_pad' in the batch when "
+                    f"{self.config.do_mask_loss_for_padding=}."
+                )
             in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         return loss.mean()
-
-    @torch.no_grad()
-    def generate_actions(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
-        batch_size = batch["observation.state"].shape[0]
-        device = batch["observation.state"].device
-        
-        global_cond = self._prepare_global_conditioning(batch)
-
-        # 从纯噪声开始（x_T ≈ N(0,1)）
-        current_sample = torch.randn(
-            batch_size, self.config.horizon, self.config.action_feature.shape[0],
-            device=device
-        )
-
-        # 逆向去噪循环（T → 0）
-        for t in reversed(range(self.scheduler.num_train_timesteps)):
-            ts = torch.full((batch_size,), t, device=device, dtype=torch.long)
-            
-            # 模型输出直接作为 pred_x0
-            model_output = self.net(current_sample, ts, global_cond)
-            
-            # 使用新的 x-prediction step
-            current_sample = self.scheduler.step(model_output, t, current_sample)
-
-        # 提取需要的动作段
-        start = self.config.n_obs_steps - 1
-        end = start + self.config.n_action_steps
-        return current_sample[:, start:end]

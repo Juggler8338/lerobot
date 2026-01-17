@@ -49,12 +49,12 @@ class JiTConfig(PreTrainedConfig):
     activation: str = "gelu"
 
     # Noise scheduler.
-    training_noise_sampling: str = "uniform"  # "uniform" or "beta", from pi0 https://www.physicalintelligence.company/download/pi0.pdf
+    training_noise_sampling: str = "beta"  # "uniform" or "beta", from pi0 https://www.physicalintelligence.company/download/pi0.pdf
     clip_sample: bool = True
     clip_sample_range: float = 1.0
 
     # Inference
-    num_inference_steps: int | None = 100
+    num_inference_steps: int | None = 10
 
     # Loss computation
     do_mask_loss_for_padding: bool = False
