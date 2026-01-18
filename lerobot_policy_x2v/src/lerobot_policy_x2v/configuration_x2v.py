@@ -43,13 +43,9 @@ class X2VConfig(PreTrainedConfig):
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
     # Noise scheduler.
-    noise_scheduler_type: str = "DDPM"
-    num_train_timesteps: int = 100
-    beta_schedule: str = "squaredcos_cap_v2"
-    beta_start: float = 0.0001
-    beta_end: float = 0.02
-    prediction_type: str = "epsilon"
-    clip_sample: bool = True
+    training_noise_sampling: str = "uniform"  # or "beta"
+    num_inference_steps: int | None = 100
+    clip_sample: bool = False
     clip_sample_range: float = 1.0
 
     # Inference
@@ -66,6 +62,7 @@ class X2VConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
+
     def __post_init__(self):
         super().__post_init__()
 
@@ -75,18 +72,11 @@ class X2VConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
-        supported_prediction_types = ["epsilon", "sample"]
-        if self.prediction_type not in supported_prediction_types:
+        if self.training_noise_sampling not in ("uniform", "beta"):
             raise ValueError(
-                f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
+                f"`training_noise_sampling` must be either 'uniform' or 'beta'. Got {self.training_noise_sampling}."
             )
-        supported_noise_schedulers = ["DDPM", "DDIM"]
-        if self.noise_scheduler_type not in supported_noise_schedulers:
-            raise ValueError(
-                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
-                f"Got {self.noise_scheduler_type}."
-            )
-
+        
         # Check that the horizon size and U-Net downsampling is compatible.
         # U-Net downsamples by 2 with each stage.
         downsampling_factor = 2 ** len(self.down_dims)
