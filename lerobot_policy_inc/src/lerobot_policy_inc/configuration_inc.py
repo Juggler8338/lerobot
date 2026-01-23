@@ -7,9 +7,9 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.configs.types import NormalizationMode
 
 
-@PreTrainedConfig.register_subclass("dit")
+@PreTrainedConfig.register_subclass("inc-dp")
 @dataclass
-class DitConfig(PreTrainedConfig):
+class INCConfig(PreTrainedConfig):
     # Inputs / output structure.
     n_obs_steps: int = 2
     horizon: int = 16
@@ -39,7 +39,7 @@ class DitConfig(PreTrainedConfig):
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
 
-    # Diffusion Transformer (DiT) parameters.
+    # In context Transformer (DiT) parameters.
     frequency_embedding_dim: int = 256
     hidden_dim: int = 768
     num_blocks: int = 6

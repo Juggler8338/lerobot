@@ -142,7 +142,7 @@ class DiffusionModel(nn.Module):
 
         self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
-        # 新增：噪声分布（训练时采样 t）
+        # added noise sampling strategy
         self.training_noise_sampling = config.training_noise_sampling  # 添加到 config
         if config.training_noise_sampling == "uniform":
             self.noise_distribution = torch.distributions.Uniform(0, 1)
@@ -154,7 +154,7 @@ class DiffusionModel(nn.Module):
         else:
             raise ValueError(...)
 
-        # 新增：推理步数（默认 100，与 DiTFlow 一致）
+        # new: inference steps
         self.num_inference_steps = config.num_inference_steps or 100
 
     # ========= inference  ============
@@ -169,7 +169,7 @@ class DiffusionModel(nn.Module):
         dtype = get_dtype_from_parameters(self)
 
         # 从纯噪声开始（对应 t=0）
-        sample = torch.randn(
+        z = torch.randn(
             batch_size, self.config.horizon, self.config.action_feature.shape[0],
             device=device, dtype=dtype, generator=generator
         )
@@ -181,14 +181,26 @@ class DiffusionModel(nn.Module):
         # t 从 0 到 1（不包括1）
         for k in range(self.num_inference_steps):
             t = torch.full((batch_size,), k / self.num_inference_steps, device=device, dtype=dtype)
-            velocity = self.unet(sample, t, global_cond=global_cond)
-            sample = sample + dt * velocity
+            # 后续逻辑保持不变
+            t_exp = t[:, None, None]  # (B, 1, 1) 用于广播
 
-            # 可选：DiTFlow 的 clip
+            # 模型预测 clean x (即 X_1)
+            x_pred = self.unet(z, t, global_cond=global_cond)  
+
+            # 计算速度场 v = (X_1 - X_t) / (1 - t)
+            # Rectified Flow 的标准推导公式
+            one_minus_t = (1 - t_exp)
+            v_pred = (x_pred - z) / one_minus_t 
+
+            # # 改为直接预测速度场 v 
+            # v_pred = self.unet(z, t, global_cond=global_cond)
+            # Euler 积分更新
+            z = z + dt * v_pred
+
             if self.config.clip_sample:
-                sample = torch.clamp(sample, -self.config.clip_sample_range, self.config.clip_sample_range)
+                z = torch.clamp(z, -self.config.clip_sample_range, self.config.clip_sample_range)
 
-        return sample
+        return z
 
     def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
@@ -286,21 +298,19 @@ class DiffusionModel(nn.Module):
         device = trajectory.device
         B = trajectory.shape[0]
         noise = torch.randn_like(trajectory)
-        t = self.noise_distribution.sample((B,)).to(device)  # (B,)
-
+        timesteps = self.noise_distribution.sample((B,)).to(device)  # (B,)
+        t = timesteps[:, None, None]  # (B, 1, 1) 用于广播
         # 【新】线性插值加噪
-        noisy_trajectory = (1 - t[:, None, None]) * noise + t[:, None, None] * trajectory
+        noisy_trajectory = (1 - t) * noise + t * trajectory
 
         # added global conditioning
         global_cond = self._prepare_global_conditioning(batch)
 
         # predict the velocity, t is float in [0, 1]
-        pred_velocity = self.unet(noisy_trajectory, t, global_cond=global_cond)  # (B, T, D)
+        pred_x = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
 
-        # 【新】target 是 velocity = traj - noise
-        target_velocity = trajectory - noise
-
-        loss = F.mse_loss(pred_velocity, target_velocity, reduction="none")
+        # compute mse loss
+        loss = F.mse_loss(pred_x, trajectory, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
         if self.config.do_mask_loss_for_padding:
@@ -495,22 +505,29 @@ def _replace_submodules(
     return root_module
 
 
-class DiffusionSinusoidalPosEmb(nn.Module):
-    """1D sinusoidal positional embeddings as in Attention is All You Need."""
-
-    def __init__(self, dim: int):
+class _TimeNetwork(nn.Module):
+    def __init__(
+        self, frequency_embedding_dim, hidden_dim, learnable_w=False, max_period=1000
+    ):
+        assert frequency_embedding_dim % 2 == 0, "time_dim must be even!"
+        half_dim = int(frequency_embedding_dim // 2)
         super().__init__()
-        self.dim = dim
 
-    def forward(self, x: Tensor) -> Tensor:
-        device = x.device
-        half_dim = self.dim // 2
-        emb = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
-        emb = x.unsqueeze(-1) * emb.unsqueeze(0)
-        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
-        return emb
+        w = np.log(max_period) / (half_dim - 1)
+        w = torch.exp(torch.arange(half_dim) * -w).float()
+        self.register_parameter("w", nn.Parameter(w, requires_grad=learnable_w))
 
+        self.out_net = nn.Sequential(
+            nn.Linear(frequency_embedding_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+    def forward(self, t):
+        assert len(t.shape) == 1, "assumes 1d input timestep array"
+        t = t[:, None] * self.w[None]
+        t = torch.cat((torch.cos(t), torch.sin(t)), dim=1)
+        return self.out_net(t)
 
 class DiffusionConv1dBlock(nn.Module):
     """Conv1d --> GroupNorm --> Mish"""
@@ -540,11 +557,11 @@ class DiffusionConditionalUnet1d(nn.Module):
         self.config = config
 
         # Encoder for the diffusion timestep.
-        self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
-            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
-            nn.Mish(),
-            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
+        self.time_encoder = _TimeNetwork(
+            frequency_embedding_dim=config.frequency_embedding_dim or 256,
+            hidden_dim=config.diffusion_step_embed_dim,   # 输出维度保持和原来一致
+            learnable_w=config.learnable_time_freq or False,  # 可选：是否让频率可学习
+            max_period=1000,  # DiTFlow 原值
         )
 
         # The FiLM conditioning dimension.
@@ -623,7 +640,8 @@ class DiffusionConditionalUnet1d(nn.Module):
         # For 1D convolutions we'll need feature dimension first.
         x = einops.rearrange(x, "b t d -> b d t")
 
-        timesteps_embed = self.diffusion_step_encoder(timestep*1000.0)  # scale t to [0,1000] as in original code
+        # timestep 是 (B,) 的 float tensor，范围 [0,1]
+        timesteps_embed = self.time_encoder(timestep)  # 输出 (B, diffusion_step_embed_dim)
 
         # If there is a global conditioning feature, concatenate it to the timestep embedding.
         if global_cond is not None:

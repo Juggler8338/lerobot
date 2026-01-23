@@ -1,3 +1,20 @@
+
+#!/usr/bin/env python
+
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from dataclasses import dataclass, field
 
 from lerobot.configs.policies import PreTrainedConfig
@@ -6,10 +23,9 @@ from lerobot.optim.optimizers import AdamConfig
 from lerobot.optim.schedulers import DiffuserSchedulerConfig
 
 
-@PreTrainedConfig.register_subclass("x2v_diffusion")
+@PreTrainedConfig.register_subclass("trans")
 @dataclass
-class X2VConfig(PreTrainedConfig):
-
+class TransDiffusionConfig(PreTrainedConfig):
     # Inputs / output structure.
     n_obs_steps: int = 2
     horizon: int = 16
@@ -36,21 +52,25 @@ class X2VConfig(PreTrainedConfig):
     use_group_norm: bool = True
     spatial_softmax_num_keypoints: int = 32
     use_separate_rgb_encoder_per_camera: bool = False
-    # Unet.
-    down_dims: tuple[int, ...] = (256, 512, 1024)
-    kernel_size: int = 5
-    n_groups: int = 8
-    diffusion_step_embed_dim: int = 128
-    use_film_scale_modulation: bool = True
+    # Diffusion model 
+    transformer_n_layer: int = 8          # Transformer 层数
+    transformer_n_head: int = 8           # Attention head 数
+    transformer_n_emb: int = 512           # Embedding 维度
+    transformer_p_drop_emb: float = 0.1    # Input embedding dropout
+    transformer_p_drop_attn: float = 0.1   # Attention dropout
+    transformer_causal_attn: bool = False  # 是否使用 causal mask（False 与原U-Net并行去噪一致）
+    transformer_time_as_cond: bool = True  # 时间步是否作为 conditioning token
+    transformer_n_cond_layers: int = 0     # conditioning encoder 层数（0=MLP，>0=TransformerEncoder）
     # Noise scheduler.
-    training_noise_sampling: str = "uniform"  # or "beta"
-    num_inference_steps: int | None = 100
-    clip_sample: bool = False
+    noise_scheduler_type: str = "DDPM"
+    num_train_timesteps: int = 100
+    beta_schedule: str = "squaredcos_cap_v2"
+    beta_start: float = 0.0001
+    beta_end: float = 0.02
+    prediction_type: str = "sample"
+    clip_sample: bool = True
     clip_sample_range: float = 1.0
 
-    frequency_embedding_dim: int = 256
-    learnable_time_freq: bool = False
-    
     # Inference
     num_inference_steps: int | None = None
 
@@ -65,7 +85,6 @@ class X2VConfig(PreTrainedConfig):
     scheduler_name: str = "cosine"
     scheduler_warmup_steps: int = 500
 
-
     def __post_init__(self):
         super().__post_init__()
 
@@ -75,19 +94,18 @@ class X2VConfig(PreTrainedConfig):
                 f"`vision_backbone` must be one of the ResNet variants. Got {self.vision_backbone}."
             )
 
-        if self.training_noise_sampling not in ("uniform", "beta"):
+        supported_prediction_types = ["epsilon", "sample"]
+        if self.prediction_type not in supported_prediction_types:
             raise ValueError(
-                f"`training_noise_sampling` must be either 'uniform' or 'beta'. Got {self.training_noise_sampling}."
+                f"`prediction_type` must be one of {supported_prediction_types}. Got {self.prediction_type}."
             )
-        
-        # Check that the horizon size and U-Net downsampling is compatible.
-        # U-Net downsamples by 2 with each stage.
-        downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
+        supported_noise_schedulers = ["DDPM", "DDIM"]
+        if self.noise_scheduler_type not in supported_noise_schedulers:
             raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor (which is determined "
-                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+                f"`noise_scheduler_type` must be one of {supported_noise_schedulers}. "
+                f"Got {self.noise_scheduler_type}."
             )
+
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(

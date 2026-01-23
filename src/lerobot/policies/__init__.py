@@ -16,8 +16,6 @@ from .act.configuration_act import ACTConfig as ACTConfig
 
 from .jit.configuration_jit import JiTConfig as JiTConfig
 from .diffusion.configuration_diffusion import DiffusionConfig as DiffusionConfig
-from .diffusion_t.configuration_dit import DitConfig as DitConfig
-
 from .sarm.configuration_sarm import SARMConfig as SARMConfig
 from .groot.configuration_groot import GrootConfig as GrootConfig
 from .pi0.configuration_pi0 import PI0Config as PI0Config
@@ -32,7 +30,6 @@ from .xvla.configuration_xvla import XVLAConfig as XVLAConfig
 __all__ = [
     "ACTConfig",
     "DiffusionConfig",
-    "DitConfig",
     "JiTConfig",
     "PI0Config",
     "PI05Config",

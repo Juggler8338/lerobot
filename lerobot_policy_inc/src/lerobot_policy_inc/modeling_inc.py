@@ -14,7 +14,7 @@ from lerobot.utils.constants import (
     OBS_IMAGES,
 )
 from lerobot.policies.diffusion.modeling_diffusion import DiffusionRgbEncoder
-from lerobot.policies.jit.configuration_jit import JiTConfig
+from lerobot_policy_inc.configuration_inc import INCConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import (
     get_device_from_parameters,
@@ -62,7 +62,7 @@ class _TimeNetwork(nn.Module):
         t = torch.cat((torch.cos(t), torch.sin(t)), dim=1)
         return self.out_net(t)
 
-class _JiTDecoder(nn.Module):
+class _INCDecoder(nn.Module):
     def __init__(
         self, d_model=256, nhead=6, dim_feedforward=2048, dropout=0.0, activation="gelu"
     ):
@@ -133,8 +133,7 @@ class _TransformerDecoder(nn.Module):
             [copy.deepcopy(base_module) for _ in range(num_layers)]
         )
         self.reset_parameters()
-
-    # 移除 t, cond 参数
+        
     def forward(self, src, **kwargs):
         x = src
         for layer in self.layers:
@@ -146,7 +145,7 @@ class _TransformerDecoder(nn.Module):
             layer.reset_parameters()
 
 
-class _JiTNet(nn.Module):
+class _DenoiseNet(nn.Module):
     def __init__(
         self,
         ac_dim,
@@ -163,7 +162,7 @@ class _JiTNet(nn.Module):
         clip_sample=False,
         clip_sample_range=1.0,
     ):
-        """ JiT Velocity Network
+        """ Denoise Network
         Args:
             ac_dim: Action dimension.
             ac_chunk: Number of action steps to predict in one forward pass.
@@ -202,7 +201,7 @@ class _JiTNet(nn.Module):
         self.obs_pos = nn.Parameter(torch.randn(n_obs_steps, 1, hidden_dim))
 
         # decoder blocks
-        decoder_module = _JiTDecoder(
+        decoder_module = _INCDecoder(
             hidden_dim,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
@@ -297,13 +296,13 @@ class _JiTNet(nn.Module):
         )
 
 
-class JiTPolicy(PreTrainedPolicy):
-    config_class = JiTConfig
-    name = "Jit"
+class INCPolicy(PreTrainedPolicy):
+    config_class = INCConfig
+    name = "inc-dp"
 
     def __init__(
         self,
-        config: JiTConfig,
+        config: INCConfig,
         **kwargs
         # dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
     ):
@@ -411,7 +410,7 @@ class JiTPolicy(PreTrainedPolicy):
 
 
 class DiTModel(nn.Module):
-    def __init__(self, config: JiTConfig):
+    def __init__(self, config: INCConfig):
         super().__init__()
         self.config = config
 
@@ -435,7 +434,7 @@ class DiTModel(nn.Module):
             global_cond_dim += self.config.env_state_feature.shape[0]
 
         self.global_cond_dim = global_cond_dim
-        self.velocity_net = _JiTNet(
+        self.velocity_net = _DenoiseNet(
             ac_dim=config.action_feature.shape[0],
             ac_chunk=config.horizon,
             cond_dim=self.global_cond_dim,

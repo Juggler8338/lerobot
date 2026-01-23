@@ -12,8 +12,8 @@ from lerobot.configs.types import NormalizationMode
 class JiTConfig(PreTrainedConfig):
     # Inputs / output structure.
     n_obs_steps: int = 2
-    horizon: int = 32
-    n_action_steps: int = 16
+    horizon: int = 16
+    n_action_steps: int = 8
 
     use_proprioceptive: bool = True
 
@@ -54,7 +54,7 @@ class JiTConfig(PreTrainedConfig):
     clip_sample_range: float = 1.0
 
     # Inference
-    num_inference_steps: int | None = 10
+    num_inference_steps: int | None = 100
 
     # Loss computation
     do_mask_loss_for_padding: bool = False

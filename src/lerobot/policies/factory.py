@@ -32,7 +32,6 @@ from lerobot.envs.utils import env_to_policy_features
 from lerobot.policies.act.configuration_act import ACTConfig
 
 from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
-from lerobot.policies.diffusion_t.configuration_dit import DitConfig
 from lerobot.policies.jit.configuration_jit import JiTConfig
 
 from lerobot.policies.groot.configuration_groot import GrootConfig
@@ -307,13 +306,6 @@ def make_pre_post_processors(
         from lerobot.policies.diffusion.processor_diffusion import make_diffusion_pre_post_processors
 
         processors = make_diffusion_pre_post_processors(
-            config=policy_cfg,
-            dataset_stats=kwargs.get("dataset_stats"),
-        )
-    elif isinstance(policy_cfg, DitConfig):
-        from lerobot.policies.diffusion_t.processor_dit import make_dit_pre_post_processors
-
-        processors = make_dit_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )

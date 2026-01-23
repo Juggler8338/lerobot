@@ -5,7 +5,7 @@ from typing import Any
 
 import torch
 
-from lerobot.policies.diffusion_t.configuration_dit import DitConfig
+from lerobot_policy_inc.src.lerobot_policy_inc.configuration_inc import INCConfig
 from lerobot.processor import (
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
@@ -25,8 +25,8 @@ from lerobot.utils.constants import (
 )
 
 
-def make_dit_pre_post_processors(
-    config: DitConfig,
+def make_inc_pre_post_processors(
+    config: INCConfig,
     dataset_stats: dict[str, dict[str, torch.Tensor]] | None = None,
 ) -> tuple[
     PolicyProcessorPipeline[dict[str, Any], dict[str, Any]],

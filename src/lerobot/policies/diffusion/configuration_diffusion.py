@@ -142,7 +142,7 @@ class DiffusionConfig(PreTrainedConfig):
     beta_schedule: str = "squaredcos_cap_v2"
     beta_start: float = 0.0001
     beta_end: float = 0.02
-    prediction_type: str = "epsilon"
+    prediction_type: str = "sample"
     clip_sample: bool = True
     clip_sample_range: float = 1.0
 
